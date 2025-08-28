@@ -1,0 +1,840 @@
+--!nolint LocalShadow
+--!strict
+--!native
+
+--[[
+    TODO:
+        - Encoding modes ('ascii', 'utf-8')
+        - Nicer error handling
+        - Clean up `json.decode`.
+]]
+
+type JsonArray = {Value};
+type JsonObject = {[string]: Value};
+export type Value = nil | boolean | number | string | buffer | JsonArray | JsonObject;
+export type ValueType = "null" | "boolean" | "number" | "string" | "array" | "object";
+export type JsonTableType = "object" | "array";
+export type Encoding = "ascii" | "utf8";
+
+--[=[
+    Options for `json.encode`.
+]=]
+export type JsonEncodeOptions = {
+    --[=[
+        Whether to pretty print the 
+    ]=]
+    pretty: boolean|number?,
+
+    --[=[
+        Whether to skip escaping on `buffer` values.
+
+        Caller accepts responsibility to make sure the buffer contents are
+        properly escaped if necessary.
+    ]=] 
+    raw_buffers: boolean?,
+    --encoding: Encoding?,
+};
+
+--[=[
+    Options for `json.decode`.
+]=]
+export type JsonDecodeOptions = {
+    mark_tables: boolean?,
+};
+
+local INITIAL_BUFFER_SIZE = 1024;
+local BUFFER_EXPAND_RATE = 1.5;
+
+--[[
+--- Cached indent string prefixes to prevent
+local PREALLOCATED_INDENTS = 64;
+local INDENT_LEVELS: {string} = table.create(PREALLOCATED_INDENTS, nil :: any); do
+    for i = 1, PREALLOCATED_INDENTS do
+        INDENT_LEVELS[i] = string.rep("    ", i);
+    end
+    
+    setmetatable(INDENT_LEVELS, {
+        __index = function(_, depth: number): string
+            local str = string.rep("    ", depth);
+            rawset(INDENT_LEVELS, depth, str);
+            return str;
+        end
+    });
+end
+]]
+
+local TABLE_TYPE_METAFIELD = "__jsontabletype";
+
+local NULL_MAGIC = 0x6C6C756E; -- "null"
+local TRUE_MAGIC = 0x65757274; -- "true"
+local FALSE_MAGIC_2, FALSE_MAGIC_1  = 0x65, 0x736C6166; -- "false"
+local ASCII_ESCAPE_MAGIC = 0x3030755C; -- "\u00"
+local EMPTY_ARRAY_MAGIC = 0x5D5B;
+local EMPTY_OBJECT_MAGIC = 0x7D7B;
+local UC_ESCAPE_MAGIC = 0x755C; -- "\u"
+
+local NEWLINE = string.byte("\n"); -- \n
+local SPACE = string.byte(" "); -- SP
+local QUOT = string.byte("\""); -- "
+local COMMA = string.byte(","); -- ,
+local COLON = string.byte(":"); -- :
+local LSQUAREBRACKET = string.byte("["); -- [
+local RSQUAREBRACKET = string.byte("]"); -- ]
+local LCURLYBRACKET = string.byte("{"); -- {
+local RCURLYBRACKET = string.byte("}");
+local BACKSLASH = string.byte("\\");
+
+local HEX_NIBBLES = { [0] = 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46 };
+
+local ESCAPE_PATTERN = "[\"\\%c]";
+local ESCAPE_REPLACEMENTS = {
+    [string.byte("\"")] = string.byte("\""),
+    [string.byte("\\")] = string.byte("\\"),
+    [string.byte("\b")] = string.byte("b"),
+    [string.byte("\t")] = string.byte("t"),
+    [string.byte("\n")] = string.byte("n"),
+    [string.byte("\f")] = string.byte("f"),
+    [string.byte("\r")] = string.byte("r"),
+};
+
+--- Escapes control and structural characters within a string.
+local function escape(input: string --[[, encoding: Encoding]]): (buffer, number)
+    local len = #input;
+
+    if not string.match(input, ESCAPE_PATTERN) then
+        return buffer.fromstring(input), len;
+    end
+
+    local input = buffer.fromstring(input);
+    local b = buffer.create(len * 6); -- worst case
+
+    local cursor = 0;
+
+    for i = 0, len - 1 do
+        local char = buffer.readu8(input, i);
+        local replacement = ESCAPE_REPLACEMENTS[char];
+
+        if replacement then
+            buffer.writeu8(b, cursor, BACKSLASH);
+            buffer.writeu8(b, cursor + 1, replacement);
+            cursor += 2;
+        else
+            if char < 0x20 then
+                buffer.writeu32(b, cursor, ASCII_ESCAPE_MAGIC);
+                buffer.writeu8(b, cursor + 4, HEX_NIBBLES[bit32.band(bit32.rshift(char, 4), 0xF)]);
+                buffer.writeu8(b, cursor + 5, HEX_NIBBLES[bit32.band(char, 0xF)]);
+                cursor += 6;
+            else
+                buffer.writeu8(b, cursor, char);
+                cursor += 1;
+            end
+        end
+    end
+    
+    local trimmed = buffer.create(cursor);
+    buffer.copy(trimmed, 0, b, 0, cursor);
+    return trimmed, cursor;
+end
+
+--- Returns a metafield value for `tbl`.
+local function get_metafield(tbl: any, field: string): any?
+    local mt = getmetatable(tbl);
+    if mt then
+        return (mt :: any)[field];
+    end
+
+    return nil;
+end
+
+--- Sets a metafield value for `tbl`, creating a metatable if necessary.
+local function set_metafield(tbl: any, field: string, value: any)
+    local mt = getmetatable(tbl);
+    if not mt then
+        mt = {};
+        setmetatable(tbl, mt);
+    end
+
+    (mt :: any)[field] = value;
+end
+
+--- Returns (1) whether `value` encodes to an object, and (2) whether it contains any values.
+local function is_object(tbl: any): (boolean, boolean)
+    local array = #tbl ~= 0;
+    local map = next(tbl) ~= nil;
+
+    if array then
+        return false, true; -- Array
+    elseif map then
+        return true, true;
+    else
+        return get_metafield(tbl, TABLE_TYPE_METAFIELD) == "object", false;
+    end
+end
+
+local WHITESPACE = {
+    [string.byte(" ")]  = true,
+    [string.byte("\t")] = true,
+    [string.byte("\r")] = true,
+    [string.byte("\n")] = true,
+};
+local UNESCAPE_PATTERN = "\\";
+
+local UNESCAPE_REPLACEMENTS = {
+    [string.byte("\"")] = string.byte("\""),
+    [string.byte("\\")] = string.byte("\\"),
+    [string.byte("/")] = string.byte("/"),
+    [string.byte("b")] = string.byte("\b"),
+    [string.byte("t")] = string.byte("\t"),
+    [string.byte("n")] = string.byte("\n"),
+    [string.byte("f")] = string.byte("\f"),
+    [string.byte("r")] = string.byte("\r"),
+};
+
+--- Returns whether the passed ASCII byte is a `0..9` digit.
+local function is_digit(char: number): boolean
+    return char >= 48 and char <= 57;
+end
+
+--- Returns whether the passed codepoint is a high surrogate codepoint.
+local function is_high_surrogate(codepoint: number)
+    return codepoint >= 0xD800 and codepoint <= 0xDBFF;
+end
+
+--- Returns whether the passed codepoint is a low surrogate codepoint.
+local function is_low_surrogate(codepoint: number)
+    return codepoint >= 0xDC00 and codepoint <= 0xDFFF;
+end
+
+--- Combines two UTF-16 surrogate codepoints into a single codepoint.
+local function combine_surrogates(high: number, low: number): number
+    return 0x10000 + bit32.lshift(high - 0xD800, 10) + (low - 0xDC00)
+end
+
+--- Reverses escape sequences from a string.
+local function unescape_string(input: string): string
+    if not string.match(input, UNESCAPE_PATTERN) then
+        return input;
+    end
+
+    local input = buffer.fromstring(input);
+    local len = buffer.len(input);
+    local b = buffer.create(len);
+
+    local cursor = 0;
+
+    local i = 0;
+    while i < len do
+        local char = buffer.readu8(input, i); i += 1;
+        if char ~= BACKSLASH then
+            buffer.writeu8(b, cursor, char);
+            cursor += 1;
+            continue;
+        end
+
+        local char = buffer.readu8(input, i); i += 1;
+        if UNESCAPE_REPLACEMENTS[char] then
+            buffer.writeu8(b, cursor, UNESCAPE_REPLACEMENTS[char]);
+            cursor += 1;
+            continue;
+        elseif char == string.byte("u") then
+            if i + 4 > len then
+                error("expected unicode codepoint");
+            end
+            local high_surrogate = tonumber(buffer.readstring(input, i, 4), 16) or error("invalid codepoint"); i += 4;
+            local codepoint;
+
+            if is_high_surrogate(high_surrogate) then
+                if i + 6 > len or buffer.readu16(input, i) ~= UC_ESCAPE_MAGIC then
+                    error("expected second surrogate");
+                end
+                i += 2;
+
+                local low_surrogate = tonumber(buffer.readstring(input, i, 4), 16) or error("invalid codepoint"); i += 4;
+                if not is_low_surrogate(low_surrogate) then
+                    error("expected second surrogate");
+                end
+                codepoint = combine_surrogates(high_surrogate, low_surrogate);
+            else
+                codepoint = high_surrogate;
+            end
+
+            local encoded = utf8.char(codepoint);
+            local len = #encoded;
+            buffer.writestring(b, cursor, encoded);
+            cursor += len;
+        else
+            error("unexpected escape");
+        end
+    end
+    
+    return buffer.readstring(b, 0, cursor);
+end
+
+--[=[
+    Javascript Object Notation library.
+]=]
+local json = {};
+
+local null: nil = newproxy(true);
+set_metafield(null, "__type", "null");
+set_metafield(null, "__tostring", function() return "null"; end);
+
+--[=[
+    Null placeholder value.
+]=]
+json.null = null;
+
+--[=[
+    Sets the default table type for a given `table`.
+
+    This function sets the `__jsontabletype` metafield to indicate to parsers
+    what syntax to use for an empty structure (`{}` vs `[]`).
+
+    Possible values:
+    - `"object"`
+    - `"array"`
+    - `nil` (remove tag)
+]=]
+function json.set_json_table_type(tbl: any, json_table_type: JsonTableType?)
+    set_metafield(tbl, TABLE_TYPE_METAFIELD, json_table_type);
+end
+
+--[=[
+    Returns the default table type for a given `table`.
+]=]
+function json.get_json_table_type(tbl: any): JsonTableType
+    return get_metafield(tbl, TABLE_TYPE_METAFIELD);
+end
+
+--[=[
+    Returns the JSON type a given value will encode to, or `nil` if it can't
+    be encoded.
+]=]
+function json.typeof(value: Value): ValueType?
+    if type(value) == "boolean" then
+        return "boolean";
+    elseif type(value) == "number" then
+        return "number";
+    elseif type(value) == "string" then
+        return "string";
+    elseif type(value) == "table" then
+        local is_object = is_object(value);
+        return if is_object then "object" else "array";
+    elseif value == null then
+        return "null";
+    end
+
+    return nil;
+end
+
+--[=[
+    Encodes a value as a JSON buffer.
+]=]
+function json.encode(value: Value, options: JsonEncodeOptions?): buffer
+    local options = options or {} :: JsonEncodeOptions;
+
+    local pretty = options.pretty or false;
+    local raw_buffers = options.raw_buffers or false;
+
+    if type(pretty) == "boolean" then
+        pretty = 4;
+    end
+    local pretty = pretty :: number;
+    
+
+    --local encoding: Encoding = options.encoding or "utf8";
+
+    local b = buffer.create(INITIAL_BUFFER_SIZE);
+    buffer.fill(b, 0, SPACE);
+    local cursor = 0;
+    local depth = 0;
+
+    local function check_size(amount: number)
+        local len = buffer.len(b);
+        local needed = cursor + amount;
+        if needed >= len then
+            local new = buffer.create(needed * BUFFER_EXPAND_RATE);
+            buffer.fill(new, 0, SPACE);
+            buffer.copy(new, 0, b);
+            b = new;
+        end
+    end
+
+    local function write_byte(value: number)
+        check_size(1);
+        buffer.writeu8(b, cursor, value);
+        cursor += 1;
+    end
+
+    local function write_newline()
+        if not pretty then
+            return;
+        end
+
+        write_byte(NEWLINE);
+    end
+
+    local function write_indent()
+        if not pretty or depth == 0 then
+            return;
+        end
+
+        --- We aren't writing anything here, so we dont need to call `check_size`.
+        cursor += depth * pretty;
+    end
+
+    local function write_null()
+        check_size(4);
+        buffer.writeu32(b, cursor, NULL_MAGIC);
+        cursor += 4;
+    end
+
+    local function write_boolean(value: boolean)
+        if value then
+            check_size(4);
+            buffer.writeu32(b, cursor, TRUE_MAGIC);
+            cursor += 4;
+        else
+            check_size(5);
+            buffer.writeu32(b, cursor, FALSE_MAGIC_1);
+            buffer.writeu8(b, cursor + 4, FALSE_MAGIC_2);
+            cursor += 5;
+        end
+    end
+
+    local function write_number(value: number)
+        local str = tostring(value);
+        local len = #str;
+        check_size(len);
+        buffer.writestring(b, cursor, str);
+        cursor += len;
+    end
+
+    local function write_string(value: string)
+        local value, inner_size = escape(value --[[, encoding]]);
+        local outer_size = inner_size + 2;
+        check_size(outer_size);
+        buffer.writeu8(b, cursor, QUOT);
+        buffer.copy(b, cursor + 1, value);
+        buffer.writeu8(b, cursor + inner_size + 1, QUOT);
+        cursor += outer_size;
+    end
+
+    local function write_buffer(value: buffer)
+        if not raw_buffers then
+            write_string(buffer.tostring(value));
+            return;
+        end
+
+        local inner_size = buffer.len(value);
+        local outer_size = inner_size + 2;
+        check_size(outer_size);
+        buffer.writeu8(b, cursor, QUOT);
+        buffer.copy(b, cursor + 1, value);
+        buffer.writeu8(b, cursor + inner_size + 1, QUOT);
+        cursor += outer_size;
+    end
+
+    local write_value;
+
+    local function write_array(value: JsonArray)
+        write_byte(LSQUAREBRACKET);
+        depth += 1;
+        write_newline();
+
+        local count = #value;
+        for i, v: Value in value do
+            write_indent();
+            write_value(v);
+            if i ~= count then
+                write_byte(COMMA);    
+            end
+            write_newline();
+        end
+
+        depth -= 1;
+        write_indent();
+        write_byte(RSQUAREBRACKET);
+    end
+
+    local function write_object(value: JsonObject)
+        write_byte(LCURLYBRACKET);
+        depth += 1;
+        write_newline();
+
+        local first = true;
+
+        for k, v: Value in value do
+            if first then
+                first = false;
+            else
+                write_byte(COMMA);
+                write_newline();
+            end
+
+            write_indent();
+
+            write_string(k);
+
+            write_byte(COLON);
+            if pretty then
+                write_byte(SPACE);
+            end
+
+            write_value(v);
+        end
+
+        write_newline();
+
+        depth -= 1;
+        write_indent();
+        write_byte(RCURLYBRACKET);        
+    end
+
+    local function write_table(value: any)
+        local is_object, has_values = is_object(value);
+
+        if is_object then
+            if has_values then
+                write_object(value);
+            else
+                buffer.writeu16(b, cursor, EMPTY_OBJECT_MAGIC);
+                cursor += 2;
+            end
+        else
+            if has_values then
+                write_array(value);
+            else
+                buffer.writeu16(b, cursor, EMPTY_ARRAY_MAGIC);
+                cursor += 2;
+            end
+        end
+    end
+
+    function write_value(value: Value)
+        if type(value) == "boolean" then
+            write_boolean(value);
+        elseif type(value) == "number" then
+            write_number(value);
+        elseif type(value) == "string" then
+            write_string(value);
+        elseif type(value) == "buffer" then
+            write_buffer(value);
+        elseif type(value) == "table" then
+            write_table(value);
+        elseif value == null then
+            write_null();
+        end
+    end
+
+    write_value(value);
+
+    local trimmed = buffer.create(cursor);
+    buffer.copy(trimmed, 0, b, 0, cursor);
+    return trimmed;
+end
+
+--[=[
+    Encodes an array of values as a [JSON Lines](https://jsonlines.org/) buffer.
+]=]
+function json.encode_lines(values: {Value}): buffer
+    local size = 0;
+    local buffers: {buffer} = table.create(#values, nil :: any);
+
+    for i, value in values do
+        local encoded = json.encode(value, { pretty = false });
+        buffers[i] = encoded;
+        size += buffer.len(encoded) + 1;
+    end
+
+    local final = buffer.create(size);
+    buffer.fill(final, 0, NEWLINE);
+    
+    local cursor = 0;
+    for i, b in buffers do
+        buffer.copy(final, cursor, b);
+        cursor += buffer.len(b) + 1;
+    end
+
+    return final;
+end
+
+local function is_true_literal(char1: number, char2: number, char3: number, char4: number): boolean
+    return char1 == string.byte("t") and char2 == string.byte("r") and char3 == string.byte("u") and char4 == string.byte("e");
+end
+
+local function is_false_literal(char1: number, char2: number, char3: number, char4: number, char5: number): boolean
+    return char1 == string.byte("f") and char2 == string.byte("a") and char3 == string.byte("l") and char4 == string.byte("s") and char5 == string.byte("e");
+end
+
+local function is_null_literal(char1: number, char2: number, char3: number, char4: number): boolean
+    return char1 == string.byte("n") and char2 == string.byte("u") and char3 == string.byte("l") and char4 == string.byte("l");
+end
+
+--[=[
+    Decodes a JSON buffer into a value.
+
+    Expects `input` to be `utf8` encoded.
+]=]
+function json.decode(input: buffer | string, options: JsonDecodeOptions?): Value
+    local input = if type(input) == "buffer" then input else buffer.fromstring(input);
+
+    local options = options or {} :: JsonDecodeOptions;
+    local mark_tables = if options.mark_tables == nil then true else options.mark_tables;
+
+    local cursor = 0;
+    local len = buffer.len(input);
+
+    local function at_eof(): boolean
+        return cursor >= len;
+    end
+
+    local function peek_char(lookahead: number): number
+        local cursor = cursor + (lookahead - 1);
+        return if cursor >= len then 0 else buffer.readu8(input, cursor);
+    end
+
+    local function advance(amount: number)
+        cursor += amount;
+    end
+
+    local function substring(start: number, finish: number?): string
+        local finish = finish or cursor;
+        local count = math.min(finish - start, len - start);
+        return buffer.readstring(input, math.max(start, 0), math.max(count, 0));
+    end
+
+    local function discard_whitespace()
+        if not WHITESPACE[peek_char(1)] then
+            return;
+        end
+        
+        advance(1);
+
+        while not at_eof() do
+            if WHITESPACE[peek_char(1)] then
+                advance(1);
+            else
+                break;
+            end
+        end
+    end
+
+    local function read_string(): string
+        advance(1);
+
+        local string_start = cursor;
+
+        while true do
+            if at_eof() then
+                error("unexpected <eof>");
+            end
+            
+            local char = peek_char(1);
+
+            if char == QUOT then
+                advance(1);
+                break;
+            elseif char == NEWLINE or (char == string.byte("\r") and peek_char(2) == NEWLINE) then
+                error("malformed string");
+            elseif char == BACKSLASH and peek_char(2) == QUOT then
+                advance(2);
+            else
+                advance(1);
+            end
+        end
+
+        if string_start == cursor then
+            return "";            
+        end
+        
+        return unescape_string(substring(string_start, cursor - 1));
+    end
+
+    local function read_number(): number
+        local number_start = cursor;
+        if peek_char(1) == string.byte("-") then
+            advance(1);
+        end
+
+        local encountered_dot = false;
+        local encountered_e: boolean = false;
+
+        while true do
+            if at_eof() then
+                break;
+            end
+            
+            local char = peek_char(1);
+
+            if is_digit(char) then
+                advance(1);
+            elseif char == string.byte(".") and not encountered_dot then
+                encountered_dot = true;
+                advance(1);
+            elseif (char == string.byte("e") or char == string.byte("E")) and not encountered_e then
+                encountered_e = true;
+                advance(1);
+                local char = peek_char(1);
+                if char == string.byte("-") or char == string.byte("+") then
+                    advance(1);
+                end
+            else
+                break;
+            end
+        end
+
+        return tonumber(substring(number_start, cursor)) or error("malformed number");
+    end
+
+    local read_value;
+
+    local function read_array(): JsonArray
+        advance(1);
+        discard_whitespace();
+        
+        if peek_char(1) == RSQUAREBRACKET then
+            return {};
+        end
+
+        local array: JsonArray = {};
+
+        if mark_tables then
+            set_metafield(array, TABLE_TYPE_METAFIELD, "array");
+        end
+        
+        while true do
+            if at_eof() then
+                error("unexpected <eof>");
+            end
+
+            discard_whitespace();
+            local value = read_value();
+            table.insert(array, value);
+            discard_whitespace();
+
+            local char = peek_char(1);
+            if char == RSQUAREBRACKET then
+                advance(1);
+                discard_whitespace();
+                return array;
+            elseif char == COMMA then
+                advance(1);
+                discard_whitespace();
+            else
+                error(`unexpected character {string.char(peek_char(1))}`);
+            end
+        end
+    end
+
+    local function read_object(): JsonObject
+        advance(1);
+        discard_whitespace();
+        
+        if peek_char(1) == RCURLYBRACKET then
+            return {};
+        end
+
+        local object: JsonObject = {};
+
+        if mark_tables then
+            set_metafield(object, TABLE_TYPE_METAFIELD, "object");
+        end
+
+        while true do
+            if at_eof() then
+                error("unexpected <eof>");
+            end
+
+            discard_whitespace();
+            if peek_char(1) ~= QUOT then
+                error("expected string key");
+            end
+            local key = read_string();
+            discard_whitespace();
+
+            if peek_char(1) ~= COLON then
+                error(`unexpected character {string.char(peek_char(1))}`);
+            end
+            advance(1);
+            
+            discard_whitespace();
+            local value = read_value();
+            discard_whitespace();
+
+            object[key] = value;
+
+            local char = peek_char(1);
+            if char == RCURLYBRACKET then
+                advance(1);
+                discard_whitespace();
+                return object;
+            elseif char == COMMA then
+                advance(1);
+                discard_whitespace();
+            else
+                error(`unexpected character {string.char(peek_char(1))}`);
+            end
+        end
+    end
+
+    function read_value(): Value
+        local char = peek_char(1);
+
+        if char == QUOT then
+            return read_string();
+        elseif is_digit(char) or char == string.byte("-") and is_digit(peek_char(2)) then
+            return read_number();
+        elseif char == LSQUAREBRACKET then
+            return read_array();
+        elseif char == LCURLYBRACKET then
+            return read_object();
+        else
+            local char1, char2, char3, char4 = char, peek_char(2), peek_char(3), peek_char(4);
+
+            if is_true_literal(char1, char2, char3, char4) then
+                advance(4);
+                return true;
+            elseif is_false_literal(char1, char2, char3, char4, peek_char(5)) then
+                advance(5);
+                return false;
+            elseif is_null_literal(char1, char2, char3, char4) then
+                advance(4);
+                return null;
+            else
+                error(`unexpected character {string.char(peek_char(1))}`);
+            end
+        end
+    end
+
+    discard_whitespace();
+    local root = read_value();
+    discard_whitespace();
+
+    if not at_eof() then
+        error(`unexpected character '{string.char(peek_char(1))}'`);
+    end
+
+    return root;
+end
+
+--[=[
+    Decodes a [JSON Lines](https://jsonlines.org/) buffer into an array of values.
+]=]
+function json.decode_lines(input: buffer | string): {Value}
+    local input = if type(input) == "string" then input else buffer.tostring(input);
+    local lines = string.split(input, "\n");
+    if lines[#lines] == "" then
+        table.remove(lines, #lines);
+    end
+
+    local values = {};
+    
+    for i, v in lines do
+        values[i] = json.decode(v);
+    end
+
+    return values;
+end
+
+return json;
