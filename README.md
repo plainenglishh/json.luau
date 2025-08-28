@@ -75,5 +75,5 @@ Luau and JSON are inconsistent in a few ways:
 To patch these inconsistencies, `json.luau`:
 
 1. provides a `json.null` constant to explicitly mark a value as `null`.
-2. checks for a `__jsontype` meta-field to determine what table types to default
+2. checks for a `__jsontype` meta-field to determine what table type to default
    to for any given ambiguous table.
