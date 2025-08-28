@@ -279,7 +279,7 @@ set_metafield(null, "__tostring", function() return "null"; end);
 json.null = null;
 
 --[=[
-    Sets the default table type for a given `table`.
+    Sets the default table type for `tbl`.
 
     This function sets the `__jsontabletype` metafield to indicate to parsers
     what syntax to use for an empty structure (`{}` vs `[]`).
@@ -295,7 +295,7 @@ function json.set_json_type<T>(tbl: T, json_type: JsonTableType?): T
 end
 
 --[=[
-    Returns the default table type for a given `table`.
+    Returns the default table type for `tbl`.
 ]=]
 function json.get_json_type(tbl: JsonArray | JsonObject): JsonTableType
     return get_metafield(tbl, TABLE_TYPE_METAFIELD) or "array";

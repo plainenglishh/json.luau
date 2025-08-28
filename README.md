@@ -58,15 +58,11 @@ print(buffer.tostring(encoded));
 }
 ```
 
-### Buffers
+### Raw Buffers
 
-The encoder can accept `buffer`s, which are treated the same as `string` values
-by default.
-
-The encoder `raw_buffer` flag can be enabled to insert buffers as-is, with
-surrounding quotes. This can massively speed up encoding, but passes the onus on
-the caller to ensure the buffer doesn't contain invalid characters. In
-`raw_buffer` mode, the encoder doesn't validate whether the buffer is escaped.
+The encoder `raw_buffer` flag can be enabled to skip character escaping and
+validation in `buffer` values. This can massively speed up encoding, but passes
+the onus onto the caller to ensure buffers don't contain invalid characters.
 
 ### Luau/JSON Inconsistencies
 
@@ -76,18 +72,8 @@ Luau and JSON are inconsistent in a few ways:
    `undefined`;
 2. Luau does not differentiate between arrays and objects.
 
-#### Null
+To patch these inconsistencies, `json.luau`:
 
-The library provides a `json.null` constant to explicitly mark a value as
-`null`.
-
-#### Table Types
-
-The library also provides a mechanism for specifying whether a table is an array
-or an object: table types.
-
-When the type of a table is ambiguous, the encoder checks for the `__jsontype`
-meta-field to determine what type it should default to.
-
-The library provides `json.get_json_type` and `json.get_json_type` to assist
-with this.
+1. provides a `json.null` constant to explicitly mark a value as `null`.
+2. checks for a `__jsontype` meta-field to determine what table types to default
+   to for any given ambiguous table.
