@@ -275,6 +275,8 @@ end
 ]=]
 local json = {};
 
+json.VERSION = "v0.1.0";
+
 local null: nil = newproxy(true);
 set_metafield(null, "__type", "null");
 set_metafield(null, "__tostring", function() return "null"; end);
