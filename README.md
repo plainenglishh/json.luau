@@ -4,6 +4,8 @@ A reasonably fast pure-Luau JSON library.
 
 ## Usage
 
+### Example
+
 ```luau
 local json = require("@json/");
 
@@ -11,13 +13,16 @@ local empty_array = {};
 json.set_json_type(empty_array, "array");
 
 local value = {
-    hello = "world",
-    a = {1, 2, 3},
-    b = { a = 1, b = 2, c = 3 },
+    null = json.null,
+    boolean_true = true,
+    boolean_false = false,
+    number = -1000,
+    string = "Hello, World!",
+    raw_buf = buffer.fromstring("i KNOW this doesn't contain invalid chars"),
+    array = {1, 2, 3},
+    object = { a = 1, b = 2, c = 3 },
     empty_array = empty_array,
     empty_object = json.set_json_type({}, "object"),
-    raw_buf = buffer.fromstring("i KNOW this doesn't contain invalid chars"),
-    null =
 };
 
 local encoded = json.encode(value, {
@@ -27,6 +32,8 @@ local encoded = json.encode(value, {
 
 print(buffer.tostring(encoded));
 ```
+
+#### Output
 
 ```json
 {
