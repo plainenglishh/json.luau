@@ -9,10 +9,10 @@
         - Clean up `json.decode`.
 ]]
 
-type JsonArray = {Value};
-type JsonObject = {[string]: Value};
-export type Value = nil | boolean | number | string | buffer | JsonArray | JsonObject;
-export type ValueType = "null" | "boolean" | "number" | "string" | "array" | "object";
+type JsonArray = {JsonValue};
+type JsonObject = {[string]: JsonValue};
+export type JsonValue = nil | boolean | number | string | buffer | JsonArray | JsonObject;
+export type JsonType = "null" | "boolean" | "number" | "string" | JsonTableType;
 export type JsonTableType = "object" | "array";
 export type Encoding = "ascii" | "utf8";
 
@@ -21,49 +21,41 @@ export type Encoding = "ascii" | "utf8";
 ]=]
 export type JsonEncodeOptions = {
     --[=[
-        Whether to pretty print the 
+        Whether to pretty print the encoded JSON. When set to a number, 
+        specifies the indent size in spaces. Assumes an indent size of `4` when
+        set to `true`.
+        
+        Defaults to `false`.
     ]=]
     pretty: boolean|number?,
 
     --[=[
-        Whether to skip escaping on `buffer` values.
-
+        Whether to skip escaping on `buffer` values. 
+        
         Caller accepts responsibility to make sure the buffer contents are
         properly escaped if necessary.
+
+        Defaults to `false`.
     ]=] 
     raw_buffers: boolean?,
-    --encoding: Encoding?,
 };
 
 --[=[
     Options for `json.decode`.
 ]=]
 export type JsonDecodeOptions = {
-    mark_tables: boolean?,
+    --[=[
+        Whether to preserve objects and arrays using `json.set_json_type`.
+
+        Defaults to `true`.
+    ]=]
+    preserve_table_types: boolean?,
 };
 
 local INITIAL_BUFFER_SIZE = 1024;
 local BUFFER_EXPAND_RATE = 1.5;
 
---[[
---- Cached indent string prefixes to prevent
-local PREALLOCATED_INDENTS = 64;
-local INDENT_LEVELS: {string} = table.create(PREALLOCATED_INDENTS, nil :: any); do
-    for i = 1, PREALLOCATED_INDENTS do
-        INDENT_LEVELS[i] = string.rep("    ", i);
-    end
-    
-    setmetatable(INDENT_LEVELS, {
-        __index = function(_, depth: number): string
-            local str = string.rep("    ", depth);
-            rawset(INDENT_LEVELS, depth, str);
-            return str;
-        end
-    });
-end
-]]
-
-local TABLE_TYPE_METAFIELD = "__jsontabletype";
+local TABLE_TYPE_METAFIELD = "__jsontype";
 
 local NULL_MAGIC = 0x6C6C756E; -- "null"
 local TRUE_MAGIC = 0x65757274; -- "true"
@@ -297,22 +289,23 @@ json.null = null;
     - `"array"`
     - `nil` (remove tag)
 ]=]
-function json.set_json_table_type(tbl: any, json_table_type: JsonTableType?)
-    set_metafield(tbl, TABLE_TYPE_METAFIELD, json_table_type);
+function json.set_json_type<T>(tbl: T, json_type: JsonTableType?): T
+    set_metafield(tbl, TABLE_TYPE_METAFIELD, json_type);
+    return tbl;
 end
 
 --[=[
     Returns the default table type for a given `table`.
 ]=]
-function json.get_json_table_type(tbl: any): JsonTableType
-    return get_metafield(tbl, TABLE_TYPE_METAFIELD);
+function json.get_json_type(tbl: JsonArray | JsonObject): JsonTableType
+    return get_metafield(tbl, TABLE_TYPE_METAFIELD) or "array";
 end
 
 --[=[
     Returns the JSON type a given value will encode to, or `nil` if it can't
     be encoded.
 ]=]
-function json.typeof(value: Value): ValueType?
+function json.typeof(value: JsonValue): JsonType?
     if type(value) == "boolean" then
         return "boolean";
     elseif type(value) == "number" then
@@ -332,7 +325,7 @@ end
 --[=[
     Encodes a value as a JSON buffer.
 ]=]
-function json.encode(value: Value, options: JsonEncodeOptions?): buffer
+function json.encode(value: JsonValue, options: JsonEncodeOptions?): buffer
     local options = options or {} :: JsonEncodeOptions;
 
     local pretty = options.pretty or false;
@@ -445,7 +438,7 @@ function json.encode(value: Value, options: JsonEncodeOptions?): buffer
         write_newline();
 
         local count = #value;
-        for i, v: Value in value do
+        for i, v: JsonValue in value do
             write_indent();
             write_value(v);
             if i ~= count then
@@ -466,7 +459,7 @@ function json.encode(value: Value, options: JsonEncodeOptions?): buffer
 
         local first = true;
 
-        for k, v: Value in value do
+        for k, v: JsonValue in value do
             if first then
                 first = false;
             else
@@ -513,7 +506,7 @@ function json.encode(value: Value, options: JsonEncodeOptions?): buffer
         end
     end
 
-    function write_value(value: Value)
+    function write_value(value: JsonValue)
         if type(value) == "boolean" then
             write_boolean(value);
         elseif type(value) == "number" then
@@ -539,7 +532,7 @@ end
 --[=[
     Encodes an array of values as a [JSON Lines](https://jsonlines.org/) buffer.
 ]=]
-function json.encode_lines(values: {Value}): buffer
+function json.encode_lines(values: {JsonValue}): buffer
     local size = 0;
     local buffers: {buffer} = table.create(#values, nil :: any);
 
@@ -578,11 +571,11 @@ end
 
     Expects `input` to be `utf8` encoded.
 ]=]
-function json.decode(input: buffer | string, options: JsonDecodeOptions?): Value
+function json.decode(input: buffer | string, options: JsonDecodeOptions?): JsonValue
     local input = if type(input) == "buffer" then input else buffer.fromstring(input);
 
     local options = options or {} :: JsonDecodeOptions;
-    local mark_tables = if options.mark_tables == nil then true else options.mark_tables;
+    local preserve_table_types = if options.preserve_table_types == nil then true else options.preserve_table_types;
 
     local cursor = 0;
     local len = buffer.len(input);
@@ -701,7 +694,7 @@ function json.decode(input: buffer | string, options: JsonDecodeOptions?): Value
 
         local array: JsonArray = {};
 
-        if mark_tables then
+        if preserve_table_types then
             set_metafield(array, TABLE_TYPE_METAFIELD, "array");
         end
         
@@ -739,7 +732,7 @@ function json.decode(input: buffer | string, options: JsonDecodeOptions?): Value
 
         local object: JsonObject = {};
 
-        if mark_tables then
+        if preserve_table_types then
             set_metafield(object, TABLE_TYPE_METAFIELD, "object");
         end
 
@@ -780,7 +773,7 @@ function json.decode(input: buffer | string, options: JsonDecodeOptions?): Value
         end
     end
 
-    function read_value(): Value
+    function read_value(): JsonValue
         local char = peek_char(1);
 
         if char == QUOT then
@@ -823,7 +816,7 @@ end
 --[=[
     Decodes a [JSON Lines](https://jsonlines.org/) buffer into an array of values.
 ]=]
-function json.decode_lines(input: buffer | string): {Value}
+function json.decode_lines(input: buffer | string): {JsonValue}
     local input = if type(input) == "string" then input else buffer.tostring(input);
     local lines = string.split(input, "\n");
     if lines[#lines] == "" then
