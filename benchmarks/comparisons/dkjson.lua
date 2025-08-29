@@ -1,3 +1,5 @@
+--!native
+
 -- Module options:
 local always_try_using_lpeg = true
 local register_global_module_table = false
