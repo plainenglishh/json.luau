@@ -3,5 +3,8 @@
         "lune": "~/.lune/.typedefs/0.10.1/",
         "json": "./src"
     },
+    "lint": {
+        "LocalShadow": false
+    },
     "languageMode": "strict"
 }

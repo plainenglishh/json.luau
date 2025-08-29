@@ -1,0 +1,3 @@
+- [ ] Encoding modes (`ascii`, `utf-8`)
+- [ ] Nicer error handling
+- [ ] Clean up and optimise `json.decode`.

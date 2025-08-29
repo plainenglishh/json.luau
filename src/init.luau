@@ -1,13 +1,5 @@
---!nolint LocalShadow
 --!strict
 --!native
-
---[[
-    TODO:
-        - Encoding modes ('ascii', 'utf-8')
-        - Nicer error handling
-        - Clean up `json.decode`.
-]]
 
 type JsonArray = {JsonValue};
 type JsonObject = {[string]: JsonValue};
@@ -169,6 +161,7 @@ local WHITESPACE = {
     [string.byte("\r")] = true,
     [string.byte("\n")] = true,
 };
+
 local UNESCAPE_PATTERN = "\\";
 
 local UNESCAPE_REPLACEMENTS = {
