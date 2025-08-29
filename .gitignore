@@ -1,2 +1,5 @@
 test.luau
 benchmark_results.txt
+dev/__pycache__
+profile.out
+flamegraph.svg

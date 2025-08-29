@@ -329,7 +329,6 @@ function json.encode(value: JsonValue, options: JsonEncodeOptions?): buffer
     end
     local pretty = pretty :: number;
     
-
     --local encoding: Encoding = options.encoding or "utf8";
 
     local b = buffer.create(INITIAL_BUFFER_SIZE);
@@ -582,21 +581,28 @@ function json.decode(input: buffer | string, options: JsonDecodeOptions?): JsonV
         return if cursor >= len then 0 else buffer.readu8(input, cursor);
     end
 
+    local function err_unexpected_char(char: number?)
+        local char = char or peek_char(1);
+        if char == 0 then
+            error("unexpected <eof>");
+        else
+            error(string.format("uexpected character 0x%2X", char));
+        end
+    end
+
     local function advance(amount: number)
         cursor += amount;
     end
 
-    local function substring(start: number, finish: number?): string
-        local finish = finish or cursor;
-        local count = math.min(finish - start, len - start);
-        return buffer.readstring(input, math.max(start, 0), math.max(count, 0));
+    local function substring(start: number, finish: number): string
+        return buffer.readstring(input, start, finish - start);
     end
 
     local function discard_whitespace()
         if not WHITESPACE[peek_char(1)] then
-            return;
+            return
         end
-        
+
         advance(1);
 
         while not at_eof() do
@@ -614,29 +620,24 @@ function json.decode(input: buffer | string, options: JsonDecodeOptions?): JsonV
         local string_start = cursor;
 
         while true do
-            if at_eof() then
-                error("unexpected <eof>");
-            end
-            
             local char = peek_char(1);
 
             if char == QUOT then
                 advance(1);
-                break;
-            elseif char == NEWLINE or (char == string.byte("\r") and peek_char(2) == NEWLINE) then
+                
+                if string_start == cursor then
+                    return "";            
+                end
+                
+                return unescape_string(substring(string_start, cursor - 1));
+            elseif char == NEWLINE then
                 error("malformed string");
-            elseif char == BACKSLASH and peek_char(2) == QUOT then
+            elseif char == BACKSLASH then
                 advance(2);
             else
                 advance(1);
             end
         end
-
-        if string_start == cursor then
-            return "";            
-        end
-        
-        return unescape_string(substring(string_start, cursor - 1));
     end
 
     local function read_number(): number
@@ -679,49 +680,33 @@ function json.decode(input: buffer | string, options: JsonDecodeOptions?): JsonV
 
     local function read_array(): JsonArray
         advance(1);
-        discard_whitespace();
-        
-        if peek_char(1) == RSQUAREBRACKET then
-            return {};
-        end
 
         local array: JsonArray = {};
 
         if preserve_table_types then
             set_metafield(array, TABLE_TYPE_METAFIELD, "array");
         end
-        
-        while true do
-            if at_eof() then
-                error("unexpected <eof>");
-            end
 
-            discard_whitespace();
-            local value = read_value();
-            table.insert(array, value);
+        while true do
             discard_whitespace();
 
             local char = peek_char(1);
             if char == RSQUAREBRACKET then
                 advance(1);
-                discard_whitespace();
                 return array;
-            elseif char == COMMA then
+            end
+            
+            local value = read_value();
+            table.insert(array, value);
+
+            if peek_char(1) == COMMA then
                 advance(1);
-                discard_whitespace();
-            else
-                error(`unexpected character {string.char(peek_char(1))}`);
             end
         end
     end
 
     local function read_object(): JsonObject
         advance(1);
-        discard_whitespace();
-        
-        if peek_char(1) == RCURLYBRACKET then
-            return {};
-        end
 
         local object: JsonObject = {};
 
@@ -730,77 +715,75 @@ function json.decode(input: buffer | string, options: JsonDecodeOptions?): JsonV
         end
 
         while true do
-            if at_eof() then
-                error("unexpected <eof>");
-            end
-
             discard_whitespace();
-            if peek_char(1) ~= QUOT then
-                error("expected string key");
-            end
-            local key = read_string();
-            discard_whitespace();
-
-            if peek_char(1) ~= COLON then
-                error(`unexpected character {string.char(peek_char(1))}`);
-            end
-            advance(1);
-            
-            discard_whitespace();
-            local value = read_value();
-            discard_whitespace();
-
-            object[key] = value;
 
             local char = peek_char(1);
             if char == RCURLYBRACKET then
                 advance(1);
-                discard_whitespace();
                 return object;
-            elseif char == COMMA then
+            elseif char ~= QUOT then
+                error("expected string key");
+            end
+
+            local key = read_string();
+            discard_whitespace();
+        
+            if peek_char(1) ~= COLON then
+                err_unexpected_char();
+            end
+            advance(1);
+            
+            local value = read_value();
+
+            object[key] = value;
+
+            if peek_char(1) == COMMA then
                 advance(1);
-                discard_whitespace();
-            else
-                error(`unexpected character {string.char(peek_char(1))}`);
             end
         end
     end
 
     function read_value(): JsonValue
+        discard_whitespace();
         local char = peek_char(1);
 
+        local value;
         if char == QUOT then
-            return read_string();
+            value = read_string();
         elseif is_digit(char) or char == string.byte("-") and is_digit(peek_char(2)) then
-            return read_number();
+            value = read_number();
         elseif char == LSQUAREBRACKET then
-            return read_array();
+            value = read_array();
         elseif char == LCURLYBRACKET then
-            return read_object();
+            value = read_object();
         else
             local char1, char2, char3, char4 = char, peek_char(2), peek_char(3), peek_char(4);
 
             if is_true_literal(char1, char2, char3, char4) then
                 advance(4);
-                return true;
+                value = true;
             elseif is_false_literal(char1, char2, char3, char4, peek_char(5)) then
                 advance(5);
-                return false;
+                value = false;
             elseif is_null_literal(char1, char2, char3, char4) then
                 advance(4);
-                return null;
+                value = null;
             else
-                error(`unexpected character {string.char(peek_char(1))}`);
+                err_unexpected_char();
             end
         end
+
+        discard_whitespace();
+        return value;
     end
 
-    discard_whitespace();
-    local root = read_value();
-    discard_whitespace();
+    local ok, root = pcall(read_value);
+    if not ok then
+        error(root, 0);
+    end
 
     if not at_eof() then
-        error(`unexpected character '{string.char(peek_char(1))}'`);
+        err_unexpected_char();
     end
 
     return root;

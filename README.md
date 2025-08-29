@@ -71,7 +71,7 @@ lune run tests
 To run benchmarks, run:
 
 ```bash
-lune run benchmarks
+lune run benchs
 ```
 
 Aside from `--!native` directives, compared libraries have not been modified.
