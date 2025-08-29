@@ -161,8 +161,6 @@ local WHITESPACE = {
     [string.byte("\n")] = true,
 };
 
-local UNESCAPE_PATTERN = "\\";
-
 local UNESCAPE_REPLACEMENTS = {
     [string.byte("\"")] = string.byte("\""),
     [string.byte("\\")] = string.byte("\\"),
@@ -192,66 +190,6 @@ end
 --- Combines two UTF-16 surrogate codepoints into a single codepoint.
 local function combine_surrogates(high: number, low: number): number
     return 0x10000 + bit32.lshift(high - 0xD800, 10) + (low - 0xDC00)
-end
-
---- Reverses escape sequences from a string.
-local function unescape_string(input: string): string
-    if not string.match(input, UNESCAPE_PATTERN) then
-        return input;
-    end
-
-    local input = buffer.fromstring(input);
-    local len = buffer.len(input);
-    local b = buffer.create(len);
-
-    local cursor = 0;
-
-    local i = 0;
-    while i < len do
-        local char = buffer.readu8(input, i); i += 1;
-        if char ~= BACKSLASH then
-            buffer.writeu8(b, cursor, char);
-            cursor += 1;
-            continue;
-        end
-
-        local char = buffer.readu8(input, i); i += 1;
-        if UNESCAPE_REPLACEMENTS[char] then
-            buffer.writeu8(b, cursor, UNESCAPE_REPLACEMENTS[char]);
-            cursor += 1;
-            continue;
-        elseif char == string.byte("u") then
-            if i + 4 > len then
-                error("expected unicode codepoint");
-            end
-            local high_surrogate = tonumber(buffer.readstring(input, i, 4), 16) or error("invalid codepoint"); i += 4;
-            local codepoint;
-
-            if is_high_surrogate(high_surrogate) then
-                if i + 6 > len or buffer.readu16(input, i) ~= UC_ESCAPE_MAGIC then
-                    error("expected second surrogate");
-                end
-                i += 2;
-
-                local low_surrogate = tonumber(buffer.readstring(input, i, 4), 16) or error("invalid codepoint"); i += 4;
-                if not is_low_surrogate(low_surrogate) then
-                    error("expected second surrogate");
-                end
-                codepoint = combine_surrogates(high_surrogate, low_surrogate);
-            else
-                codepoint = high_surrogate;
-            end
-
-            local encoded = utf8.char(codepoint);
-            local len = #encoded;
-            buffer.writestring(b, cursor, encoded);
-            cursor += len;
-        else
-            error("unexpected escape");
-        end
-    end
-    
-    return buffer.readstring(b, 0, cursor);
 end
 
 --[=[
@@ -605,7 +543,11 @@ function json.decode(input: buffer | string, options: JsonDecodeOptions?): JsonV
         end
     end
 
+    local string_buffer = buffer.create(buffer.len(input));
+
     local function read_string(): string
+        local write_cursor = 0;
+
         local string_start = cursor;
 
         while true do
@@ -616,12 +558,48 @@ function json.decode(input: buffer | string, options: JsonDecodeOptions?): JsonV
                     return "";            
                 end
                 
-                local unescaped = buffer.readstring(input, string_start, cursor - 1 - string_start);
-                return unescape_string(unescaped);
-            elseif char == NEWLINE then
-                error("malformed string");
+                return buffer.readstring(string_buffer, 0, write_cursor);
             elseif char == BACKSLASH then
-                advance();
+                local char = next_char();
+
+                if UNESCAPE_REPLACEMENTS[char] then
+                    buffer.writeu8(string_buffer, write_cursor, UNESCAPE_REPLACEMENTS[char]);
+                    write_cursor += 1;
+                elseif char == string.byte("u") then
+                    if cursor + 4 > len then
+                        error("expected unicode codepoint");
+                    end
+
+                    local high_surrogate = tonumber(buffer.readstring(input, cursor, 4), 16) or error("expected unicode codepoint"); cursor += 4;
+                    local codepoint;
+
+                    if is_high_surrogate(high_surrogate) then
+                        if cursor + 6 > len or buffer.readu16(input, cursor) ~= UC_ESCAPE_MAGIC then
+                            error("expected second surrogate");
+                        end
+                        cursor += 2;
+
+                        local low_surrogate = tonumber(buffer.readstring(input, cursor, 4), 16) or error("expected unicode codepoint"); cursor += 4;
+                        if not is_low_surrogate(low_surrogate) then
+                            error("expected second surrogate");
+                        end
+                        codepoint = combine_surrogates(high_surrogate, low_surrogate);
+                    else
+                        codepoint = high_surrogate;
+                    end
+
+                    local encoded = utf8.char(codepoint);
+                    local len = #encoded;
+                    buffer.writestring(string_buffer, write_cursor, encoded);
+                    write_cursor += len;
+                else
+                    error("invalid escape");
+                end
+            elseif char < 0x20 then
+                error("malformed string");
+            else
+                buffer.writeu8(string_buffer, write_cursor, char);
+                write_cursor += 1;
             end
         end
     end

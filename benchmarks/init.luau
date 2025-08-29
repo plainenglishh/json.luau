@@ -8,6 +8,8 @@ local jsonlua = require("@self/comparisons/json") :: any;
 local jfjson = require("@self/comparisons/jfjson") :: any;
 local dkjson = require("@self/comparisons/dkjson") :: any;
 
+local ITERATIONS = 5;
+
 local URLS = {
     "https://jsonplaceholder.typicode.com/posts",
     "https://jsonplaceholder.typicode.com/comments",
@@ -30,10 +32,14 @@ local URLS = {
 };
 
 local function time<A...>(fn: (A...) -> (), ...: A...): number
-    local start = os.clock();
-    fn(...);
-    local stop = os.clock();
-    return stop - start;
+    local avg = 0;
+    for i = 1, ITERATIONS do
+        local start = os.clock();
+        fn(...);
+        local stop = os.clock();
+        avg += stop - start;
+    end
+    return avg / ITERATIONS;
 end
 
 local function speed_difference(base: number, b: number): string
