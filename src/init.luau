@@ -571,14 +571,18 @@ function json.decode(input: buffer | string, options: JsonDecodeOptions?): JsonV
         end
     end
 
-    local function next_char(): number
-        local char = if cursor < len then buffer.readu8(input, cursor) else 0;
+    local function advance()
         cursor += 1;
-        return char;
     end
 
-    local function backtrack()
+    local function retreat()
         cursor -= 1;
+    end
+
+    local function next_char(): number
+        local char = if cursor < len then buffer.readu8(input, cursor) else 0;
+        advance();
+        return char;
     end
 
     local function expect(expected: number): number
@@ -591,14 +595,10 @@ function json.decode(input: buffer | string, options: JsonDecodeOptions?): JsonV
         return 0;
     end
 
-    --[[local function advance(amount: number)
-        cursor += amount;
-    end]]
-
     local function discard_whitespace()
         while cursor < len do
             if WHITESPACE[buffer.readu8(input, cursor)] then
-                cursor += 1;
+                advance();
             else
                 break;
             end
@@ -621,7 +621,7 @@ function json.decode(input: buffer | string, options: JsonDecodeOptions?): JsonV
             elseif char == NEWLINE then
                 error("malformed string");
             elseif char == BACKSLASH then
-                cursor += 1;
+                advance();
             end
         end
     end
@@ -655,7 +655,7 @@ function json.decode(input: buffer | string, options: JsonDecodeOptions?): JsonV
                     error("expected exponent");
                 end
             else
-                backtrack();
+                retreat();
                 break;
             end
         end
@@ -680,14 +680,14 @@ function json.decode(input: buffer | string, options: JsonDecodeOptions?): JsonV
             if char == RSQUAREBRACKET then
                 return array;
             else
-                backtrack();
+                retreat();
             end
             
             local value = read_value();
             table.insert(array, value);
 
             if next_char() ~= COMMA then
-                backtrack();
+                retreat();
             end
         end
     end
@@ -719,7 +719,7 @@ function json.decode(input: buffer | string, options: JsonDecodeOptions?): JsonV
             object[key] = value;
 
             if next_char() ~= COMMA then
-                backtrack();
+                retreat();
             end
         end
     end
