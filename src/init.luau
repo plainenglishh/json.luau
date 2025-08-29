@@ -545,18 +545,6 @@ function json.encode_lines(values: {JsonValue}): buffer
     return final;
 end
 
-local function is_true_literal(char1: number, char2: number, char3: number, char4: number): boolean
-    return char1 == string.byte("t") and char2 == string.byte("r") and char3 == string.byte("u") and char4 == string.byte("e");
-end
-
-local function is_false_literal(char1: number, char2: number, char3: number, char4: number, char5: number): boolean
-    return char1 == string.byte("f") and char2 == string.byte("a") and char3 == string.byte("l") and char4 == string.byte("s") and char5 == string.byte("e");
-end
-
-local function is_null_literal(char1: number, char2: number, char3: number, char4: number): boolean
-    return char1 == string.byte("n") and char2 == string.byte("u") and char3 == string.byte("l") and char4 == string.byte("l");
-end
-
 --[=[
     Decodes a JSON buffer into a value.
 
