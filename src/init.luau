@@ -594,10 +594,6 @@ function json.decode(input: buffer | string, options: JsonDecodeOptions?): JsonV
         cursor += amount;
     end
 
-    local function substring(start: number, finish: number): string
-        return buffer.readstring(input, start, finish - start);
-    end
-
     local function discard_whitespace()
         if not WHITESPACE[peek_char(1)] then
             return
@@ -629,7 +625,8 @@ function json.decode(input: buffer | string, options: JsonDecodeOptions?): JsonV
                     return "";            
                 end
                 
-                return unescape_string(substring(string_start, cursor - 1));
+                local unescaped = buffer.readstring(input, string_start, cursor - 1 - string_start);
+                return unescape_string(unescaped);
             elseif char == NEWLINE then
                 error("malformed string");
             elseif char == BACKSLASH then
@@ -673,7 +670,8 @@ function json.decode(input: buffer | string, options: JsonDecodeOptions?): JsonV
             end
         end
 
-        return tonumber(substring(number_start, cursor)) or error("malformed number");
+        local raw_number = buffer.readstring(input, number_start, cursor - number_start);
+        return tonumber(raw_number) or error("malformed number");
     end
 
     local read_value;
