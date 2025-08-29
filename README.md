@@ -58,13 +58,31 @@ print(buffer.tostring(encoded));
 }
 ```
 
-### Raw Buffers
+## Testing
+
+To run the test suite, run:
+
+```bash
+lune run tests
+```
+
+## Benchmarks
+
+To run benchmarks, run:
+
+```bash
+lune run benchmarks
+```
+
+Aside from `--!native` directives, compared libraries have not been modified.
+
+## Raw Buffers
 
 The encoder `raw_buffer` flag can be enabled to skip character escaping and
 validation in `buffer` values. This can massively speed up encoding, but passes
 the onus onto the caller to ensure buffers don't contain invalid characters.
 
-### Luau/JSON Inconsistencies
+## Luau/JSON Inconsistencies
 
 Luau and JSON are inconsistent in a few ways:
 
