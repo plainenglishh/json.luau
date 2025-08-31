@@ -1,1 +1,2 @@
-benchmarks/comparisons/* linguist-vendored
+benchmarks/* linguist-vendored
+dev/* linguist-vendored
